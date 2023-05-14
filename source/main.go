@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -21,6 +24,189 @@ const name = "source"
 const filetype = "audio/wav"
 
 func chunkedHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Type", filetype)
+
+	// w.WriteHeader(http.StatusOK)
+	// w.Header().Set("Content-Disposition", "inline; filename="+filename)
+	// w.Header().Set("Accept-Ranges", "bytes")
+	// w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+
+	// w.WriteHeader(http.StatusPartialContent)
+
+	buf := make([]byte, 1024)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := w.(http.Flusher)
+
+Loop:
+	for {
+		select {
+		case <-ticker.C:
+			// default:
+			n, err := fileBuffer.Read(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					// End the transfer by sending a zero-length chunk
+					w.Write([]byte("0\r\n\r\n"))
+
+					break Loop
+				}
+
+				log.Println("read chunk:", err)
+
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			log.Println("reader n bytes:", n)
+
+			// Write the size of the chunk in hexadecimal format, followed by a CRLF
+			fmt.Fprintf(w, "%x\r\n", n)
+
+			n, err = w.Write(buf)
+			if err != nil {
+				log.Println("write to client connect:", err)
+
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			// Write a CRLF to indicate the end of the chunk
+			w.Write([]byte("\r\n"))
+
+			log.Println("writed n bytes:", n)
+
+			flush.Flush()
+		}
+	}
+}
+
+func sendPartialContent(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", filetype)
+
+	// Open the file to be sent
+	f, err := os.Open(filename)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	// Get the range header from the request
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader == "" {
+		http.Error(w, "Missing Range header", http.StatusBadRequest)
+		return
+	}
+
+	// Parse the range header to get the starting and ending byte positions
+	byteRange, err := parseRangeHeader(rangeHeader, f)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Seek to the starting byte position in the file
+	_, err = f.Seek(byteRange.start, 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set the Content-Length header to the size of the requested range
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", byteRange.length))
+
+	fileInfo, err := f.Stat()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Set the Content-Range header to indicate the range of bytes that were returned
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", byteRange.start, byteRange.end, fileInfo.Size()))
+
+	// Set the status code to 206 to indicate a partial response
+	w.WriteHeader(http.StatusPartialContent)
+
+	// Copy the requested portion of the file to the response body
+	io.CopyN(w, f, byteRange.length)
+}
+
+type byteRange struct {
+	start  int64
+	end    int64
+	length int64
+}
+
+func parseRangeHeader(rangeHeader string, f *os.File) (*byteRange, error) {
+	matches := rangeRegex.FindStringSubmatch(rangeHeader)
+	if matches == nil {
+		return nil, errors.New("Invalid range header")
+	}
+
+	start, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	end, err := strconv.ParseInt(matches[2], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	fileSize, err := getFileSize(f)
+	if err != nil {
+		return nil, err
+	}
+
+	if start >= fileSize || end >= fileSize || start > end {
+		return nil, errors.New("Invalid range header")
+	}
+
+	length := end - start + 1
+
+	return &byteRange{start, end, length}, nil
+}
+
+func getFileSize(f *os.File) (int64, error) {
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fileInfo.Size(), nil
+}
+
+var rangeRegex = regexp.MustCompile(`bytes=(\d+)-(\d+)?`)
+
+func plainTextHandler(w http.ResponseWriter, r *http.Request) {
+	// Set response headers
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	// Start writing the response
+	fmt.Fprintf(w, "Start of chunked response\n")
+
+	// Send first chunk
+	fmt.Fprintf(w, "This is the first chunk\n")
+	w.(http.Flusher).Flush()
+
+	// Wait for a second
+	time.Sleep(1 * time.Second)
+
+	// Send second chunk
+	fmt.Fprintf(w, "This is the second chunk\n")
+	w.(http.Flusher).Flush()
+
+	// Wait for a second
+	time.Sleep(1 * time.Second)
+
+	// Send final chunk
+	fmt.Fprintf(w, "End of chunked response\n")
+	w.(http.Flusher).Flush()
 }
 
 func serveContent(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +250,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/plain", plainTextHandler)
 	mux.HandleFunc("/chunked", chunkedHandler)
+	mux.HandleFunc("/partial", sendPartialContent)
 	mux.HandleFunc("/serve-content", serveContent)
 
 	server := &http.Server{
